@@ -37,15 +37,21 @@ func MoveToKeyword(s []byte, key byte) int {
 func ParseTCPLogV2(log string) {
 	var fields = strings.Fields(log)
 	var recovery int8
-	//var val uint64
-	//var err error
+	var timeout int8 = 0
 	var tm uint32 = 0
+	var key string
+	var value string
 
 	switch {
 	case strings.Contains(log, "IOC 101"):
 		recovery = 1
+		timeout = 0
 	case strings.Contains(log, "IOC 100"), strings.Contains(log, "IOC 102"):
 		recovery = 0
+		timeout = 0
+	case strings.Contains(log, "IOC 103"):
+		recovery = 1
+		timeout = 1
 	default:
 		return // Ignore lines that don't contain the specific IOC markers
 	}
@@ -53,10 +59,29 @@ func ParseTCPLogV2(log string) {
 	for _, field := range fields {
 		parts := strings.SplitN(field, "=", 2)
 		if len(parts) != 2 {
-			continue // Skip fields that don't have the key=value format
+			if timeout == 1 {
+				//fmt.Println("the number of parts: ", len(parts), parts[0])
+				if strings.Contains(parts[0], "Misc") {
+					misc := strings.SplitN(parts[0], "(", 2)
+					if len(misc) == 2 {
+						key = "MISC"
+						misc1 := strings.SplitN(misc[1], ")", 2)
+						value = misc1[0]
+						//fmt.Println(value)
+					} else {
+						continue
+					}
+				} else {
+					continue
+				}
+			} else {
+				continue // Skip fields that don't have the key=value format
+			}
+		} else {
+			key = parts[0]
+			value = parts[1]
 		}
-		key := parts[0]
-		value := parts[1]
+		// fmt.Println("key = ", key, " value = ", value)
 		var c *TCPConn
 		switch key {
 		case "T":
@@ -101,6 +126,10 @@ func ParseTCPLogV2(log string) {
 							c = new(TCPConn)
 							c.Init(uint16(handle), int(mssVal))
 							Conn = append(Conn, c)
+						} else {
+							if c.Mss == 0 {
+								c.Mss = int(mssVal)
+							}
 						}
 						var frame = new(TCPPacket)
 						if isRecoveryEnd {
@@ -108,7 +137,7 @@ func ParseTCPLogV2(log string) {
 						} else {
 							recovery = 1
 						}
-						frame.Init(tm, uint32(cwnd), recovery)
+						frame.Init(tm, uint32(cwnd), recovery, timeout)
 						c.AppendNewFrame(frame)
 					} else {
 						// dataParts[0] = cwnd + add_cwnd
@@ -138,12 +167,46 @@ func ParseTCPLogV2(log string) {
 							c = new(TCPConn)
 							c.Init(uint16(handle), int(mssVal))
 							Conn = append(Conn, c)
+						} else {
+							if c.Mss == 0 {
+								c.Mss = int(mssVal)
+							}
 						}
 						var frame = new(TCPPacket)
-						frame.Init(tm, uint32(cwnd&0xffff), 0)
+						frame.Init(tm, uint32(cwnd&0xffff), 0, 0)
 						c.AppendNewFrame(frame)
 					}
 				}
+			}
+		case "MISC":
+			dataParts := strings.Split(value, ",")
+			if len(dataParts) == 4 {
+				// dataParts[0] = CurSeqNum
+				// dataParts[1] = LastAckedSeqNum or HighRx
+				// dataParts[2] = handle
+				// dataParts[3] = state, 0: start, 1: end
+				handleStr := dataParts[2]
+				handle, err := strconv.ParseUint(handleStr, 16, 32)
+				c, err = TCPConn_FindExistConn(Conn, uint16(handle))
+				if err != nil {
+					if err == ErrRange {
+						return
+					}
+					c = new(TCPConn)
+					c.Init(uint16(handle), 0)
+					Conn = append(Conn, c)
+				}
+				var frame = new(TCPPacket)
+				recoveryStr := dataParts[3]
+				isRecoveryEnd, err := strconv.ParseUint(recoveryStr, 16, 32)
+				SeqNumStr := dataParts[0]
+				if isRecoveryEnd == 1 {
+					SeqNumStr = dataParts[1]
+					recovery = 2
+				}
+				SeqNum, err := strconv.ParseUint(SeqNumStr, 16, 32)
+				frame.Init(tm, uint32(SeqNum), recovery, timeout)
+				c.AppendNewFrame(frame)
 			}
 		}
 	}

@@ -1,3 +1,3 @@
-module example.com/tracer
+module example.com/tcptracer
 
-go 1.22.2
+go 1.25.6
