@@ -41,16 +41,24 @@ func ParseTCPLogV2(log string) {
 	var tm uint32 = 0
 	var key string
 	var value string
+	var rx_drop int
 
 	switch {
 	case strings.Contains(log, "IOC 101"):
 		recovery = 1
 		timeout = 0
+		rx_drop = 0
 	case strings.Contains(log, "IOC 100"), strings.Contains(log, "IOC 102"):
 		recovery = 0
 		timeout = 0
+		rx_drop = 0
 	case strings.Contains(log, "IOC 103"):
 		recovery = 1
+		timeout = 1
+		rx_drop = 0
+	case strings.Contains(log, "IOC 104"):
+		rx_drop = 1
+		recovery = 0
 		timeout = 1
 	default:
 		return // Ignore lines that don't contain the specific IOC markers
@@ -137,7 +145,7 @@ func ParseTCPLogV2(log string) {
 						} else {
 							recovery = 1
 						}
-						frame.Init(tm, uint32(cwnd), recovery, timeout)
+						frame.Init(tm, uint32(cwnd), 0, recovery, timeout, 0)
 						c.AppendNewFrame(frame)
 					} else {
 						// dataParts[0] = cwnd + add_cwnd
@@ -173,7 +181,7 @@ func ParseTCPLogV2(log string) {
 							}
 						}
 						var frame = new(TCPPacket)
-						frame.Init(tm, uint32(cwnd&0xffff), 0, 0)
+						frame.Init(tm, uint32(cwnd&0xffff), 0, 0, 0, 0)
 						c.AppendNewFrame(frame)
 					}
 				}
@@ -181,32 +189,65 @@ func ParseTCPLogV2(log string) {
 		case "MISC":
 			dataParts := strings.Split(value, ",")
 			if len(dataParts) == 4 {
-				// dataParts[0] = CurSeqNum
-				// dataParts[1] = LastAckedSeqNum or HighRx
-				// dataParts[2] = handle
-				// dataParts[3] = state, 0: start, 1: end
-				handleStr := dataParts[2]
-				handle, err := strconv.ParseUint(handleStr, 16, 32)
-				c, err = TCPConn_FindExistConn(Conn, uint16(handle))
-				if err != nil {
-					if err == ErrRange {
-						return
+				if rx_drop == 0 {
+					// dataParts[0] = CurSeqNum
+					// dataParts[1] = LastAckedSeqNum or HighRx
+					// dataParts[2] = handle
+					// dataParts[3] = state, 0: start, 1: end
+					handleStr := dataParts[2]
+					handle, err := strconv.ParseUint(handleStr, 16, 32)
+					c, err = TCPConn_FindExistConn(Conn, uint16(handle))
+					if err != nil {
+						if err == ErrRange {
+							return
+						}
+						c = new(TCPConn)
+						c.Init(uint16(handle), 0)
+						Conn = append(Conn, c)
 					}
-					c = new(TCPConn)
-					c.Init(uint16(handle), 0)
-					Conn = append(Conn, c)
+					var frame = new(TCPPacket)
+					recoveryStr := dataParts[3]
+					isRecoveryEnd, err := strconv.ParseUint(recoveryStr, 16, 32)
+					SeqNumStr := dataParts[0]
+					if isRecoveryEnd == 1 {
+						SeqNumStr = dataParts[1]
+						recovery = 2
+					}
+					SeqNum, err := strconv.ParseUint(SeqNumStr, 16, 32)
+					frame.Init(tm, uint32(SeqNum), 0, recovery, timeout, 0)
+					c.AppendNewFrame(frame)
+				} else {
+					// dataParts[0] = Expected SeqNum/the latest seq num
+					// dataParts[1] = Received SeqNum/starting miss seq num
+					// dataParts[2] = handle
+					// dataParts[3] = state, 0: end, other:
+					handleStr := dataParts[2]
+					handle, err := strconv.ParseUint(handleStr, 16, 32)
+					c, err = TCPConn_FindExistConn(Conn, uint16(handle))
+					if err != nil {
+						if err == ErrRange {
+							return
+						}
+						c = new(TCPConn)
+						c.Init(uint16(handle), 0)
+						Conn = append(Conn, c)
+					}
+					var frame = new(TCPPacket)
+					recoveryStr := dataParts[3]
+					isRecoveryEnd, err := strconv.ParseUint(recoveryStr, 16, 32)
+					SeqNumStr := dataParts[0]
+					if isRecoveryEnd == 0 {
+						recovery = 0
+					} else {
+						recovery = 1
+					}
+					SeqNum, err := strconv.ParseUint(SeqNumStr, 16, 32)
+					RecvSeqNumStr := dataParts[1]
+					RecvSeqNum, err := strconv.ParseUint(RecvSeqNumStr, 16, 32)
+					frame.Init(tm, uint32(RecvSeqNum), 1, recovery, 0, uint32(SeqNum))
+					//println("%d %x %x", recovery, RecvSeqNum , SeqNum)
+					c.AppendNewFrame(frame)
 				}
-				var frame = new(TCPPacket)
-				recoveryStr := dataParts[3]
-				isRecoveryEnd, err := strconv.ParseUint(recoveryStr, 16, 32)
-				SeqNumStr := dataParts[0]
-				if isRecoveryEnd == 1 {
-					SeqNumStr = dataParts[1]
-					recovery = 2
-				}
-				SeqNum, err := strconv.ParseUint(SeqNumStr, 16, 32)
-				frame.Init(tm, uint32(SeqNum), recovery, timeout)
-				c.AppendNewFrame(frame)
 			}
 		}
 	}
