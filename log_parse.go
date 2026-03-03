@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -254,18 +255,32 @@ func ParseTCPLogV2(log string) {
 }
 
 func main() {
+	var output io.Writer
 	fileName := flag.String("file", "tcp.log", "file to parse")
+	OutfileName := flag.String("o", "", "file to write")
 	flag.Parse()
 
 	fmt.Println("file name=", *fileName)
+	fmt.Println("output file name=", *OutfileName)
 
 	file, err := os.Open(*fileName)
 	if err != nil {
-		fmt.Println("Error opening file:", err)
+		fmt.Println("Error opening input file:", err)
 		os.Exit(1)
 	}
 	defer file.Close()
-
+	if *OutfileName != "" {
+		outfile, err := os.Create(*OutfileName)
+		if err != nil {
+			fmt.Println("Error opening output file:", err)
+			os.Exit(1)
+		}
+		defer outfile.Close() // Ensure the file is closed after the function exits.
+		output = outfile
+	} else {
+		output = os.Stdout
+	}
+	writer := bufio.NewWriter(output)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -277,6 +292,7 @@ func main() {
 	}
 
 	for _, conn := range Conn {
-		conn.Dump()
+		conn.Dump(writer)
 	}
+	writer.Flush()
 }
