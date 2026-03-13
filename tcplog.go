@@ -67,17 +67,16 @@ func (conn *TCPConn) Dump(w io.Writer) {
 	var txTimeoutOccurred int8
 	var timeoutCwnd uint32
 	var duration uint32
-	var prev_tx_pkt_tm uint32
-	var prev_rx_pkt_tm uint32
-	var prev_cwnd uint32
+	var prev_tx_index int
+	var prev_rx_index int
 
 	if len(conn.Frame) == 1 {
 		return
 	}
 
-	prev_tx_pkt_tm = 0
-	prev_rx_pkt_tm = conn.Frame[0].Time
 	txTimeoutOccurred = 0
+	prev_tx_index = -1
+	prev_rx_index = 0
 	timeoutCwnd = uint32(conn.Mss >> 10)
 
 	fmt.Fprintf(w, "Handle=%x, MSS=%d byte\n", conn.Handle, conn.Mss)
@@ -94,47 +93,46 @@ func (conn *TCPConn) Dump(w io.Writer) {
 				duration = 0
 			}
 			if conn.Frame[i].Timeout == 1 {
-				if prev_tx_pkt_tm == 0 {
+				if prev_tx_index == -1 {
 					fmt.Fprintf(w, "[TX]00000000              %08x\n", conn.Frame[i].Cwnd)
 				} else {
-					duration += (conn.Frame[i].Time - prev_tx_pkt_tm) >> 2
-					fmt.Fprintf(w, "[TX]%08d     %6d   %08x\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-prev_tx_pkt_tm)>>2, conn.Frame[i].Cwnd)
+					duration += (conn.Frame[i].Time - conn.Frame[prev_tx_index].Time) >> 2
+					fmt.Fprintf(w, "[TX]%08d     %6d   %08x\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-conn.Frame[prev_tx_index].Time)>>2, conn.Frame[i].Cwnd)
 				}
 			} else {
-				if prev_tx_pkt_tm == 0 {
+				if prev_tx_index == -1 {
 					fmt.Fprintf(w, "[TX]00000000              %08d\n", conn.Frame[i].Cwnd)
 				} else {
-					duration += (conn.Frame[i].Time - prev_tx_pkt_tm) >> 2
+					duration += (conn.Frame[i].Time - conn.Frame[prev_tx_index].Time) >> 2
 					if txTimeoutOccurred == 0 && conn.Frame[i].Cwnd == timeoutCwnd {
 						txTimeoutOccurred = 1
-						fmt.Fprintf(w, "[TX]%08d     %6d   %08d ++++\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-prev_tx_pkt_tm)>>2, conn.Frame[i].Cwnd)
+						fmt.Fprintf(w, "[TX]%08d     %6d   %08d ++++\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-conn.Frame[prev_tx_index].Time)>>2, conn.Frame[i].Cwnd)
 					} else {
 						if conn.Frame[i-1].Timeout == 1 {
-							fmt.Fprintf(w, "[TX]%08d     %6d   %08d\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-prev_tx_pkt_tm)>>2, conn.Frame[i].Cwnd)
+							fmt.Fprintf(w, "[TX]%08d     %6d   %08d\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-conn.Frame[prev_tx_index].Time)>>2, conn.Frame[i].Cwnd)
 						} else {
-							if conn.Frame[i].Cwnd > prev_cwnd {
-								fmt.Fprintf(w, "[TX]%08d     %6d   %08d +%04d\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-prev_tx_pkt_tm)>>2, conn.Frame[i].Cwnd,
-									int(conn.Frame[i].Cwnd-prev_cwnd))
-							} else if conn.Frame[i].Cwnd < prev_cwnd {
-								fmt.Fprintf(w, "[TX]%08d     %6d   %08d -%04d\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-prev_tx_pkt_tm)>>2, conn.Frame[i].Cwnd,
-									int(prev_cwnd-conn.Frame[i].Cwnd))
+							if conn.Frame[i].Cwnd > conn.Frame[prev_tx_index].Cwnd {
+								fmt.Fprintf(w, "[TX]%08d     %6d   %08d +%04d\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-conn.Frame[prev_tx_index].Time)>>2, conn.Frame[i].Cwnd,
+									int(conn.Frame[i].Cwnd-conn.Frame[prev_tx_index].Cwnd))
+							} else if conn.Frame[i].Cwnd < conn.Frame[prev_tx_index].Cwnd {
+								fmt.Fprintf(w, "[TX]%08d     %6d   %08d -%04d\n", conn.Frame[i].Time, (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-conn.Frame[prev_tx_index].Time)>>2, conn.Frame[i].Cwnd,
+									int(conn.Frame[prev_tx_index].Cwnd-conn.Frame[i].Cwnd))
 
 							} else {
-								fmt.Fprintf(w, "[TX]%08d     %6d   %08d\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-prev_tx_pkt_tm)>>2, conn.Frame[i].Cwnd)
+								fmt.Fprintf(w, "[TX]%08d     %6d   %08d\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-conn.Frame[prev_tx_index].Time)>>2, conn.Frame[i].Cwnd)
 							}
 						}
 					}
 				}
 			}
-			prev_tx_pkt_tm = conn.Frame[i].Time
-			prev_cwnd = conn.Frame[i].Cwnd
+			prev_tx_index = i
 		} else {
 			if conn.Frame[i].Recovery == 1 {
-				fmt.Fprintf(w, "[RX]%08d %08x        %08x   %05x   Start\n", (conn.Frame[i].Time-prev_rx_pkt_tm)>>2, conn.Frame[i].SeqNum, conn.Frame[i].Cwnd, conn.Frame[i].Cwnd-conn.Frame[i].SeqNum)
+				fmt.Fprintf(w, "[RX]%08d %08x        %08x   %05x   Start\n", (conn.Frame[i].Time-conn.Frame[prev_rx_index].Time)>>2, conn.Frame[i].SeqNum, conn.Frame[i].Cwnd, conn.Frame[i].Cwnd-conn.Frame[i].SeqNum)
 			} else {
-				fmt.Fprintf(w, "[RX]%08d %08x        %08x   %05x   End\n", (conn.Frame[i].Time-prev_rx_pkt_tm)>>2, conn.Frame[i].Cwnd, conn.Frame[i].SeqNum, conn.Frame[i].SeqNum-conn.Frame[i].Cwnd)
+				fmt.Fprintf(w, "[RX]%08d %08x        %08x   %05x   End\n", (conn.Frame[i].Time-conn.Frame[prev_rx_index].Time)>>2, conn.Frame[i].Cwnd, conn.Frame[i].SeqNum, conn.Frame[i].SeqNum-conn.Frame[i].Cwnd)
 			}
-			prev_rx_pkt_tm = conn.Frame[i].Time
+			prev_rx_index = i
 		}
 		if conn.Frame[i].Recovery == 1 {
 			txTimeoutOccurred = 0
