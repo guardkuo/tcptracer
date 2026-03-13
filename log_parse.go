@@ -164,6 +164,7 @@ func ParseTCPLogV2(log string) {
 						if err != nil {
 							continue
 						}
+						add_wnd := cwnd >> 16
 						mssVal, err := strconv.ParseUint(mssStr, 16, 32)
 						if err != nil {
 							continue
@@ -183,6 +184,9 @@ func ParseTCPLogV2(log string) {
 						}
 						var frame = new(TCPPacket)
 						frame.Init(tm, uint32(cwnd&0xffff), 0, 0, 0, 0)
+						if add_wnd == 0 {
+							frame.SetEst()
+						}
 						c.AppendNewFrame(frame)
 					}
 				}
