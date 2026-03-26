@@ -24,6 +24,7 @@ type TCPConn struct {
 
 var ErrRange = errors.New("value out of range")
 var ErrNotFound = errors.New("not found")
+var ErrExists = errors.New("Exists")
 
 func (f *TCPPacket) Init(time uint32, cwnd uint32, rx_drop int8, recovery int8, timeout int8, RecvSeq uint32) {
 	f.Time = time
@@ -68,17 +69,52 @@ func (conn *TCPConn) AddFrame(f *TCPPacket) {
 	conn.Frame = append(conn.Frame, f)
 }
 
+func (conn *TCPConn) DumpTx_InFastRecovery(w io.Writer, now int, prev int) {
+	if conn.Frame[now].Cwnd > conn.Frame[prev].Cwnd {
+		fmt.Fprintf(w, "[TX]%08d     %6d   %08d +%04d\n", (conn.Frame[now].Time-conn.Frame[0].Time)>>2, (conn.Frame[now].Time-conn.Frame[prev].Time)>>2, conn.Frame[now].Cwnd,
+			int(conn.Frame[now].Cwnd-conn.Frame[prev].Cwnd))
+	} else if conn.Frame[now].Cwnd < conn.Frame[prev].Cwnd {
+		fmt.Fprintf(w, "[TX]%08d     %6d   %08d -%04d\n", (conn.Frame[now].Time-conn.Frame[0].Time)>>2, (conn.Frame[now].Time-conn.Frame[prev].Time)>>2, conn.Frame[now].Cwnd,
+			int(conn.Frame[prev].Cwnd-conn.Frame[now].Cwnd))
+	} else {
+		fmt.Fprintf(w, "[TX]%08d     %6d   %08d\n", (conn.Frame[now].Time-conn.Frame[0].Time)>>2, (conn.Frame[now].Time-conn.Frame[prev].Time)>>2, conn.Frame[now].Cwnd)
+	}
+}
+
+func (conn *TCPConn) DumpTx_InRTO(w io.Writer, now int, prev int) uint32 {
+	var duration uint32
+	if prev == -1 {
+		fmt.Fprintf(w, "[TX]00000000              %08x\n", conn.Frame[now].Cwnd)
+		return 0
+	} else {
+		duration = (conn.Frame[now].Time - conn.Frame[prev].Time) >> 2
+		fmt.Fprintf(w, "[TX]%08d     %6d   %08x\n", (conn.Frame[now].Time-conn.Frame[0].Time)>>2, duration, conn.Frame[now].Cwnd)
+		return duration
+	}
+}
+
+func (conn *TCPConn) DumpRx_InRecovery(w io.Writer, now int, prev int) {
+	if conn.Frame[now].Recovery == 1 {
+		fmt.Fprintf(w, "[RX]%08d %08X        %08X   %05X   Start\n", (conn.Frame[now].Time-conn.Frame[prev].Time)>>2, conn.Frame[now].SeqNum, conn.Frame[now].Cwnd, conn.Frame[now].Cwnd-conn.Frame[now].SeqNum)
+	} else {
+		fmt.Fprintf(w, "[RX]%08d %08X        %08X   %05X   End\n", (conn.Frame[now].Time-conn.Frame[prev].Time)>>2, conn.Frame[now].Cwnd, conn.Frame[now].SeqNum, conn.Frame[now].SeqNum-conn.Frame[now].Cwnd)
+	}
+}
+
 func (conn *TCPConn) Dump(w io.Writer) {
 	var txTimeoutOccurred int8
 	var timeoutCwnd uint32
 	var duration uint32
 	var prev_tx_index int
 	var prev_rx_index int
+	var numOfFrame int
 
-	if len(conn.Frame) == 1 {
+	numOfFrame = len(conn.Frame)
+	if numOfFrame == 1 {
 		return
 	}
-
+	// .Time >> 2: us
+	// .Mss >> 10: KB
 	txTimeoutOccurred = 0
 	prev_tx_index = -1
 	prev_rx_index = 0
@@ -87,9 +123,9 @@ func (conn *TCPConn) Dump(w io.Writer) {
 	fmt.Fprintf(w, "Handle=%x, MSS=%d byte\n", conn.Handle, conn.Mss)
 	duration = 0
 
-	for i := 0; i < len(conn.Frame); i++ {
+	for i := 0; i < numOfFrame; i++ {
 		if conn.Frame[i].Est == 1 {
-			fmt.Fprintf(w, "08d     EST\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2)
+			fmt.Fprintf(w, "%08d     EST\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2)
 		} else {
 			if conn.Frame[i].RX_drop == 0 {
 				if conn.Frame[i].Recovery == 1 {
@@ -101,44 +137,29 @@ func (conn *TCPConn) Dump(w io.Writer) {
 					duration = 0
 				}
 				if conn.Frame[i].Timeout == 1 {
-					if prev_tx_index == -1 {
-						fmt.Fprintf(w, "[TX]00000000              %08x\n", conn.Frame[i].Cwnd)
-					} else {
-						duration += (conn.Frame[i].Time - conn.Frame[prev_tx_index].Time) >> 2
-						fmt.Fprintf(w, "[TX]%08d     %6d   %08x\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-conn.Frame[prev_tx_index].Time)>>2, conn.Frame[i].Cwnd)
-					}
+					duration += conn.DumpTx_InRTO(w, i, prev_tx_index)
 				} else {
 					if prev_tx_index == -1 {
 						fmt.Fprintf(w, "[TX]00000000              %08d\n", conn.Frame[i].Cwnd)
 					} else {
 						duration += (conn.Frame[i].Time - conn.Frame[prev_tx_index].Time) >> 2
 						if txTimeoutOccurred == 0 && conn.Frame[i].Cwnd == timeoutCwnd {
+							// just enter the RTO, because Cwnd is set to 1 frame
 							txTimeoutOccurred = 1
 							fmt.Fprintf(w, "[TX]%08d     %6d   %08d ++++\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-conn.Frame[prev_tx_index].Time)>>2, conn.Frame[i].Cwnd)
 						} else {
-							if conn.Frame[i-1].Timeout == 1 {
+							if conn.Frame[prev_tx_index].Timeout == 1 {
+								// just leave the RTO
 								fmt.Fprintf(w, "[TX]%08d     %6d   %08d\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-conn.Frame[prev_tx_index].Time)>>2, conn.Frame[i].Cwnd)
 							} else {
-								if conn.Frame[i].Cwnd > conn.Frame[prev_tx_index].Cwnd {
-									fmt.Fprintf(w, "[TX]%08d     %6d   %08d +%04d\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-conn.Frame[prev_tx_index].Time)>>2, conn.Frame[i].Cwnd,
-										int(conn.Frame[i].Cwnd-conn.Frame[prev_tx_index].Cwnd))
-								} else if conn.Frame[i].Cwnd < conn.Frame[prev_tx_index].Cwnd {
-									fmt.Fprintf(w, "[TX]%08d     %6d   %08d -%04d\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-conn.Frame[prev_tx_index].Time)>>2, conn.Frame[i].Cwnd,
-										int(conn.Frame[prev_tx_index].Cwnd-conn.Frame[i].Cwnd))
-								} else {
-									fmt.Fprintf(w, "[TX]%08d     %6d   %08d\n", (conn.Frame[i].Time-conn.Frame[0].Time)>>2, (conn.Frame[i].Time-conn.Frame[prev_tx_index].Time)>>2, conn.Frame[i].Cwnd)
-								}
+								conn.DumpTx_InFastRecovery(w, i, prev_tx_index)
 							}
 						}
 					}
 				}
 				prev_tx_index = i
 			} else {
-				if conn.Frame[i].Recovery == 1 {
-					fmt.Fprintf(w, "[RX]%08d %08x        %08x   %05x   Start\n", (conn.Frame[i].Time-conn.Frame[prev_rx_index].Time)>>2, conn.Frame[i].SeqNum, conn.Frame[i].Cwnd, conn.Frame[i].Cwnd-conn.Frame[i].SeqNum)
-				} else {
-					fmt.Fprintf(w, "[RX]%08d %08x        %08x   %05x   End\n", (conn.Frame[i].Time-conn.Frame[prev_rx_index].Time)>>2, conn.Frame[i].Cwnd, conn.Frame[i].SeqNum, conn.Frame[i].SeqNum-conn.Frame[i].Cwnd)
-				}
+				conn.DumpRx_InRecovery(w, i, prev_rx_index)
 				prev_rx_index = i
 			}
 		}

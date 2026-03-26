@@ -10,10 +10,11 @@ import (
 	"strings"
 )
 
+var MaxNumOfTCPConn uint16 = 4096
 var Conn []*TCPConn
 
 func TCPConn_FindExistConn(conn []*TCPConn, handle uint16) (*TCPConn, error) {
-	if handle >= 4096 {
+	if handle >= MaxNumOfTCPConn {
 		return nil, ErrRange
 	}
 	for i := 0; i < len(conn); i++ {
@@ -25,6 +26,22 @@ func TCPConn_FindExistConn(conn []*TCPConn, handle uint16) (*TCPConn, error) {
 	return nil, ErrNotFound
 }
 
+func TCPConn_GetConn(conn []*TCPConn, handle uint16) (*TCPConn, error) {
+	var c *TCPConn
+
+	c, err := TCPConn_FindExistConn(conn, handle)
+	if err != nil {
+		if err == ErrRange {
+			return nil, ErrRange
+		}
+		c = new(TCPConn)
+		c.Init(uint16(handle), 0)
+		Conn = append(Conn, c)
+		return c, nil
+	}
+	return c, ErrExists
+}
+
 func MoveToKeyword(s []byte, key byte) int {
 	for i := 0; i < len(s); i++ {
 		if key == s[i] {
@@ -33,6 +50,17 @@ func MoveToKeyword(s []byte, key byte) int {
 	}
 
 	return -1
+}
+
+func StrToTime(str string) uint32 {
+	var tm uint32 = 0
+	if len(str) >= 8 {
+		val, err := strconv.ParseUint(str[:8], 16, 32)
+		if err == nil {
+			tm = uint32(val)
+		}
+	}
+	return tm
 }
 
 func ParseTCPLogV2(log string) {
@@ -46,18 +74,22 @@ func ParseTCPLogV2(log string) {
 
 	switch {
 	case strings.Contains(log, "IOC 101"):
+		// TX fast revoery start or end
 		recovery = 1
 		timeout = 0
 		rx_drop = 0
 	case strings.Contains(log, "IOC 100"), strings.Contains(log, "IOC 102"):
+		// cwnd is updated or this connection is going to close ("IOC 102")
 		recovery = 0
 		timeout = 0
 		rx_drop = 0
 	case strings.Contains(log, "IOC 103"):
+		// TX RTO start or end
 		recovery = 1
 		timeout = 1
 		rx_drop = 0
 	case strings.Contains(log, "IOC 104"):
+		// RX drop recovery is started or ended
 		rx_drop = 1
 		recovery = 0
 		timeout = 1
@@ -69,14 +101,12 @@ func ParseTCPLogV2(log string) {
 		parts := strings.SplitN(field, "=", 2)
 		if len(parts) != 2 {
 			if timeout == 1 {
-				//fmt.Println("the number of parts: ", len(parts), parts[0])
 				if strings.Contains(parts[0], "Misc") {
 					misc := strings.SplitN(parts[0], "(", 2)
 					if len(misc) == 2 {
 						key = "MISC"
 						misc1 := strings.SplitN(misc[1], ")", 2)
 						value = misc1[0]
-						//fmt.Println(value)
 					} else {
 						continue
 					}
@@ -90,170 +120,135 @@ func ParseTCPLogV2(log string) {
 			key = parts[0]
 			value = parts[1]
 		}
-		// fmt.Println("key = ", key, " value = ", value)
 		var c *TCPConn
 		switch key {
 		case "T":
-			if len(value) >= 8 {
-				val, err := strconv.ParseUint(value[:8], 16, 32)
-				if err == nil {
-					tm = uint32(val)
-				}
-			}
+			tm = StrToTime(value)
 		case "MSS":
 			subParts := strings.Split(value, "(")
 			if len(subParts) == 2 {
 				innerValue := strings.TrimSuffix(subParts[1], ")")
 				dataParts := strings.Split(innerValue, ",")
 				if len(dataParts) == 4 {
+					var handleWithFlagsStr string
+					var cwndStr string
+					var handle uint16
+					var add_wnd uint16
+					mssStr := dataParts[2]
 					if recovery == 1 {
-						// dataParts[0] = handle + ?
-						// dataParts[1] = cwnd
-						// dataParts[2] = mss
-						handleWithFlagsStr := dataParts[0]
-						cwndStr := dataParts[1]
-						mssStr := dataParts[2]
-						handleWithFlags, err := strconv.ParseUint(handleWithFlagsStr, 16, 32)
-						if err != nil {
-							continue
-						}
-						handle := handleWithFlags >> 16
-						isRecoveryEnd := (handleWithFlags & 0xffff) == 1
-						cwnd, err := strconv.ParseUint(cwndStr, 16, 32)
-						if err != nil {
-							continue
-						}
-						mssVal, err := strconv.ParseUint(mssStr, 16, 32)
-						if err != nil {
-							continue
-						}
-						c, err = TCPConn_FindExistConn(Conn, uint16(handle))
-						if err != nil {
-							if err == ErrRange {
-								return
-							}
-							c = new(TCPConn)
-							c.Init(uint16(handle), int(mssVal))
-							Conn = append(Conn, c)
-						} else {
+						handleWithFlagsStr = dataParts[0]
+						cwndStr = dataParts[1]
+					} else {
+						handleWithFlagsStr = dataParts[1]
+						cwndStr = dataParts[0]
+					}
+					handleWithFlags, err := strconv.ParseUint(handleWithFlagsStr, 16, 32)
+					if err != nil {
+						continue
+					}
+
+					cwnd, err := strconv.ParseUint(cwndStr, 16, 32)
+					if err != nil {
+						continue
+					}
+					mssVal, err := strconv.ParseUint(mssStr, 16, 32)
+					if err != nil {
+						continue
+					}
+					if recovery == 1 {
+						handle = uint16(handleWithFlags >> 16)
+					} else {
+						handle = uint16(handleWithFlags & 0xffff)
+						add_wnd = uint16(cwnd >> 16)
+						cwnd = cwnd & 0xffff
+					}
+					c, err = TCPConn_GetConn(Conn, handle)
+					if err != nil {
+						if err == ErrExists {
 							if c.Mss == 0 {
 								c.Mss = int(mssVal)
 							}
-						}
-						var frame = new(TCPPacket)
-						if isRecoveryEnd {
-							recovery = 2
 						} else {
-							recovery = 1
+							continue
+						}
+					} else {
+						c.Mss = int(mssVal)
+					}
+					var frame = new(TCPPacket)
+					if recovery == 1 {
+						if (handleWithFlags & 0xffff) == 1 {
+							recovery = 2
 						}
 						frame.Init(tm, uint32(cwnd), 0, recovery, timeout, 0)
-						c.AppendNewFrame(frame)
 					} else {
-						// dataParts[0] = cwnd + add_cwnd
-						// dataParts[1] = handle
-						// dataParts[2] = mss
-						handleWithFlagsStr := dataParts[1]
-						cwndStr := dataParts[0]
-						mssStr := dataParts[2]
-						handleWithFlags, err := strconv.ParseUint(handleWithFlagsStr, 16, 32)
-						if err != nil {
-							continue
-						}
-						handle := handleWithFlags & 0xffff
-						cwnd, err := strconv.ParseUint(cwndStr, 16, 32)
-						if err != nil {
-							continue
-						}
-						add_wnd := cwnd >> 16
-						mssVal, err := strconv.ParseUint(mssStr, 16, 32)
-						if err != nil {
-							continue
-						}
-						c, err = TCPConn_FindExistConn(Conn, uint16(handle))
-						if err != nil {
-							if err == ErrRange {
-								return
-							}
-							c = new(TCPConn)
-							c.Init(uint16(handle), int(mssVal))
-							Conn = append(Conn, c)
-						} else {
-							if c.Mss == 0 {
-								c.Mss = int(mssVal)
-							}
-						}
-						var frame = new(TCPPacket)
-						frame.Init(tm, uint32(cwnd&0xffff), 0, 0, 0, 0)
+						frame.Init(tm, uint32(cwnd), 0, 0, 0, 0)
 						if add_wnd == 0 {
 							frame.SetEst()
 						}
-						c.AppendNewFrame(frame)
 					}
+					c.AppendNewFrame(frame)
 				}
 			}
 		case "MISC":
+			// dataParts[2] = handle
+			// rx_drop = 0
+			// dataParts[0] = CurSeqNum
+			// dataParts[1] = LastAckedSeqNum or HighRx
+			// dataParts[3] = state, 0: start, 1: end
+			// rx_drop = 1
+			// dataParts[0] = Expected SeqNum/the latest seq num
+			// dataParts[1] = Received SeqNum/starting miss seq num
+			// dataParts[3] = state, 0: end, other:
 			dataParts := strings.Split(value, ",")
 			if len(dataParts) == 4 {
+				handleStr := dataParts[2]
+				handle, err := strconv.ParseUint(handleStr, 16, 32)
+				c, err = TCPConn_GetConn(Conn, uint16(handle))
+				if err == ErrRange {
+					continue
+				}
+				var frame = new(TCPPacket)
+				recoveryStr := dataParts[3]
+				isRecoveryEnd, err := strconv.ParseUint(recoveryStr, 16, 32)
+				if err != nil {
+					isRecoveryEnd = 0
+				}
+				SeqNumStr := dataParts[0]
+
 				if rx_drop == 0 {
-					// dataParts[0] = CurSeqNum
-					// dataParts[1] = LastAckedSeqNum or HighRx
-					// dataParts[2] = handle
-					// dataParts[3] = state, 0: start, 1: end
-					handleStr := dataParts[2]
-					handle, err := strconv.ParseUint(handleStr, 16, 32)
-					c, err = TCPConn_FindExistConn(Conn, uint16(handle))
-					if err != nil {
-						if err == ErrRange {
-							return
-						}
-						c = new(TCPConn)
-						c.Init(uint16(handle), 0)
-						Conn = append(Conn, c)
-					}
-					var frame = new(TCPPacket)
-					recoveryStr := dataParts[3]
-					isRecoveryEnd, err := strconv.ParseUint(recoveryStr, 16, 32)
-					SeqNumStr := dataParts[0]
 					if isRecoveryEnd == 1 {
 						SeqNumStr = dataParts[1]
 						recovery = 2
 					}
 					SeqNum, err := strconv.ParseUint(SeqNumStr, 16, 32)
-					frame.Init(tm, uint32(SeqNum), 0, recovery, timeout, 0)
-					c.AppendNewFrame(frame)
-				} else {
-					// dataParts[0] = Expected SeqNum/the latest seq num
-					// dataParts[1] = Received SeqNum/starting miss seq num
-					// dataParts[2] = handle
-					// dataParts[3] = state, 0: end, other:
-					handleStr := dataParts[2]
-					handle, err := strconv.ParseUint(handleStr, 16, 32)
-					c, err = TCPConn_FindExistConn(Conn, uint16(handle))
 					if err != nil {
-						if err == ErrRange {
-							return
-						}
-						c = new(TCPConn)
-						c.Init(uint16(handle), 0)
-						Conn = append(Conn, c)
+						SeqNum = 0
 					}
-					var frame = new(TCPPacket)
-					recoveryStr := dataParts[3]
-					isRecoveryEnd, err := strconv.ParseUint(recoveryStr, 16, 32)
-					SeqNumStr := dataParts[0]
+					frame.Init(tm, uint32(SeqNum), 0, recovery, timeout, 0)
+				} else {
+
 					if isRecoveryEnd == 0 {
 						recovery = 0
 					} else {
 						recovery = 1
 					}
 					SeqNum, err := strconv.ParseUint(SeqNumStr, 16, 32)
+					if err != nil {
+						SeqNum = 0
+					}
 					RecvSeqNumStr := dataParts[1]
 					RecvSeqNum, err := strconv.ParseUint(RecvSeqNumStr, 16, 32)
+					if err != nil {
+						RecvSeqNum = 0
+					}
 					frame.Init(tm, uint32(RecvSeqNum), 1, recovery, 0, uint32(SeqNum))
-					//println("%d %x %x", recovery, RecvSeqNum , SeqNum)
-					c.AppendNewFrame(frame)
+
 				}
+				c.AppendNewFrame(frame)
+
 			}
+		default:
+			continue
 		}
 	}
 }
